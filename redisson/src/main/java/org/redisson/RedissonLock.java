@@ -200,6 +200,10 @@ public class RedissonLock extends RedissonBaseLock {
     }
 
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+        // 有三种场景
+        //1.当前key未加锁，就是第一个if判断，会直接写入一个hash结构，并将value设置为1
+        //2.当前key已经加锁，但是key、field都对应的上，就是所谓的重入，这种情况会将value + 1
+        //3.key已经存在，且线程ID和已经加锁的线程不一样，此时返回key的失效时间
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                 "if (redis.call('exists', KEYS[1]) == 0) then " +
                         "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
@@ -220,6 +224,8 @@ public class RedissonLock extends RedissonBaseLock {
         long time = unit.toMillis(waitTime);
         long current = System.currentTimeMillis();
         long threadId = Thread.currentThread().getId();
+        // 如果leaseTime=-1，默认设置锁过期30s，每10s续期一次
+        // 否则设置锁过期时间为leaseTime
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
@@ -231,9 +237,11 @@ public class RedissonLock extends RedissonBaseLock {
             acquireFailed(waitTime, unit, threadId);
             return false;
         }
-        
+
+        // 加锁失败，订阅对应的channel：channelName = redisson_lock__channel + 加锁的key
         current = System.currentTimeMillis();
         RFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
+        // 订阅失败的异常处理
         if (!subscribeFuture.await(time, TimeUnit.MILLISECONDS)) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.onComplete((res, e) -> {
@@ -247,12 +255,14 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 判断是否超时
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
                 acquireFailed(waitTime, unit, threadId);
                 return false;
             }
-        
+
+            // 这里是一个死循环，除非当前线程加锁成功，或者超时，直接break
             while (true) {
                 long currentTime = System.currentTimeMillis();
                 ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
@@ -261,6 +271,7 @@ public class RedissonLock extends RedissonBaseLock {
                     return true;
                 }
 
+                // 判断是否超时
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(waitTime, unit, threadId);
@@ -268,13 +279,16 @@ public class RedissonLock extends RedissonBaseLock {
                 }
 
                 // waiting for message
+                // 等待锁释放的消息，超时时间取ttl和time的较小值，然后进入下一个循环尝试获取锁
                 currentTime = System.currentTimeMillis();
                 if (ttl >= 0 && ttl < time) {
+                    // 实际通过信号量semaphore实现
                     subscribeFuture.getNow().getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
                     subscribeFuture.getNow().getLatch().tryAcquire(time, TimeUnit.MILLISECONDS);
                 }
 
+                // 判断是否超时
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(waitTime, unit, threadId);
@@ -342,6 +356,10 @@ public class RedissonLock extends RedissonBaseLock {
     }
 
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
+        //几种场景
+        //1.key、field对应的value为0，表示锁已经释放，return nil即可
+        //2.如果不等于0，就减1，如果减1之后的count依旧大于0，表示是锁重入，还有锁未释放，此时将锁实现时间重新设置为指定的阈值(如果没有指定，默认为30S)
+        //3.如果减1之后的值为0，就del即可，然后发布消息，在对应的channel中，发布个unlock消息
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
                         "return nil;" +

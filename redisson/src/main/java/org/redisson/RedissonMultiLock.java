@@ -352,6 +352,7 @@ public class RedissonMultiLock implements RLock {
 //        } catch (ExecutionException e) {
 //            throw new IllegalStateException(e);
 //        }
+        // 1.这里是在指定了锁租期的时候，会将新的锁租期设置为锁等待时间的2倍；这里我没怎么理解为什么要这么做
         long newLeaseTime = -1;
         if (leaseTime != -1) {
             if (waitTime == -1) {
@@ -360,16 +361,19 @@ public class RedissonMultiLock implements RLock {
                 newLeaseTime = unit.toMillis(waitTime)*2;
             }
         }
-        
+
+        // 2.
         long time = System.currentTimeMillis();
         long remainTime = -1;
         if (waitTime != -1) {
             remainTime = unit.toMillis(waitTime);
         }
+        // 3.对于RedLock的实现，会用remainTime / Redis节点的数量
         long lockWaitTime = calcLockWaitTime(remainTime);
         
         int failedLocksLimit = failedLocksLimit();
         List<RLock> acquiredLocks = new ArrayList<>(locks.size());
+        // 4.对所有的Redis节点进行遍历，然后依次去加锁，如果加锁失败的话，会进行一些处理；这里加锁失败的处理逻辑我还没有细看，后面再补充
         for (ListIterator<RLock> iterator = locks.listIterator(); iterator.hasNext();) {
             RLock lock = iterator.next();
             boolean lockAcquired;
@@ -420,6 +424,7 @@ public class RedissonMultiLock implements RLock {
             }
         }
 
+        // 5.设置锁的租期leaseTime
         if (leaseTime != -1) {
             acquiredLocks.stream()
                     .map(l -> (RedissonLock) l)
